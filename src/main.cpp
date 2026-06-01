@@ -4,16 +4,6 @@
  * ║   2.4" TFT Shield  ·  MCUFRIEND_kbv  ·  320×240     ║
  * ║   Wireless 2-player via ESP-NOW (no router)          ║
  * ╚══════════════════════════════════════════════════════╝
- *
- * Required libraries  (install via Arduino Library Manager):
- *   • MCUFRIEND_kbv   by David Prentice
- *   • Adafruit_GFX    by Adafruit
- *   • WiFi / esp_now  (bundled with ESP32 Arduino core)
- *
- * ── PER-DEVICE SETUP ───────────────────────────────────
- *   Device A:  set PLAYER_ID 1  and paste Device B's MAC
- *   Device B:  set PLAYER_ID 2  and paste Device A's MAC
- * ───────────────────────────────────────────────────────
  */
 
 #include <Adafruit_GFX.h>
@@ -24,8 +14,8 @@
 // ┌─────────────────────────────────────────────────────┐
 // │  CHANGE THESE TWO THINGS PER DEVICE                 │
 // └─────────────────────────────────────────────────────┘
-#define PLAYER_ID  2
-uint8_t PEER_MAC[] = {0x28, 0x56, 0x2F, 0x4B, 0x3B, 0x74};
+#define PLAYER_ID  1
+uint8_t PEER_MAC[] = {0x28, 0x56, 0x2F, 0x4A, 0x05, 0xA4};
 
 // ┌─────────────────────────────────────────────────────┐
 // │  PINS                                               │
@@ -117,12 +107,19 @@ Tank   tank[2];
 Bullet bullet[MAX_BULLETS * 2];
 Wall   wall[NUM_WALLS];
 
-Packet outPkt, inPkt;
+// Double buffering for thread-safe packet sharing
+Packet outPkt;
+Packet inPkt;          // Safe packet read by the main loop
+Packet inPktShared;    // Shared packet written by ISR callback
 volatile bool gotPacket = false;
+portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 
 int  joyXCenter = 2048;
 int  joyYCenter = 2048;
 bool prevFire   = false;
+
+// Cache to prevent redrawing HUD unless values change
+int8_t lastHUDHp[2] = {-1, -1};
 
 // ── Game state ──────────────────────────────────────────
 bool    gameOver = false;
@@ -131,12 +128,20 @@ uint8_t winner   = 0;
 // ┌─────────────────────────────────────────────────────┐
 // │  ESP-NOW                                            │
 // └─────────────────────────────────────────────────────┘
-void onRecv(const uint8_t*, const uint8_t* data, int len) {
+// ESP32 Arduino Core SDK version check for compatibility
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+void onRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+#else
+void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
+#endif
   if (len == sizeof(Packet)) {
-    memcpy(&inPkt, data, sizeof(Packet));
+    portENTER_CRITICAL_ISR(&pktMux);
+    memcpy(&inPktShared, data, sizeof(Packet));
     gotPacket = true;
+    portEXIT_CRITICAL_ISR(&pktMux);
   }
 }
+
 void onSent(const uint8_t*, esp_now_send_status_t) {}
 
 void sendPacket() {
@@ -148,7 +153,7 @@ void sendPacket() {
 // └─────────────────────────────────────────────────────┘
 bool firePressed() {
   if (digitalRead(PIN_FIRE) == LOW) {
-    delay(18);
+    delay(18); // Simple debounce
     return digitalRead(PIN_FIRE) == LOW;
   }
   return false;
@@ -176,6 +181,8 @@ void resetGame() {
 
   gameOver = false;
   winner   = 0;
+  lastHUDHp[0] = -1;
+  lastHUDHp[1] = -1;
 }
 
 // ┌─────────────────────────────────────────────────────┐
@@ -238,7 +245,8 @@ void drawWalls() {
   }
 }
 
-void drawHUD() {
+// Draws the static UI structures (drawn once per game start)
+void drawStaticHUD() {
   tft.fillRect(0, 0, SCR_W, HUD_H, C_HUD);
   tft.drawFastHLine(0, HUD_H, SCR_W, C_WALL);
 
@@ -246,38 +254,45 @@ void drawHUD() {
   tft.setTextColor(C_P1, C_HUD);
   tft.setCursor(4, 3);
   tft.print("P1");
-  for (int i = 0; i < MAX_HP; i++)
-    tft.fillRect(18 + i*10, 3, 8, 8, (i < tank[0].hp) ? C_P1 : C_HUD);
 
   tft.setTextColor(C_P2, C_HUD);
   tft.setCursor(255, 3);
   tft.print("P2");
-  for (int i = 0; i < MAX_HP; i++)
-    tft.fillRect(271 + i*10, 3, 8, 8, (i < tank[1].hp) ? C_P2 : C_HUD);
 
   tft.setTextColor(C_GREY, C_HUD);
   tft.setCursor(153, 3);
   tft.print("VS");
 }
 
+// Only redraws the HP blocks if HP changes (high performance)
+void drawHUD() {
+  // P1 HP Bar
+  if (tank[0].hp != lastHUDHp[0]) {
+    for (int i = 0; i < MAX_HP; i++) {
+      tft.fillRect(18 + i*10, 3, 8, 8, (i < tank[0].hp) ? C_P1 : C_HUD);
+    }
+    lastHUDHp[0] = tank[0].hp;
+  }
+
+  // P2 HP Bar
+  if (tank[1].hp != lastHUDHp[1]) {
+    for (int i = 0; i < MAX_HP; i++) {
+      tft.fillRect(271 + i*10, 3, 8, 8, (i < tank[1].hp) ? C_P2 : C_HUD);
+    }
+    lastHUDHp[1] = tank[1].hp;
+  }
+}
+
 void drawArena() {
   tft.fillScreen(C_BG);
   tft.drawRect(0, HUD_H, SCR_W, SCR_H - HUD_H, C_WALL);
   drawWalls();
+  drawStaticHUD();
   drawHUD();
 }
 
 // ┌─────────────────────────────────────────────────────┐
 // │  SPLASH / LOBBY                                     │
-// │                                                     │
-// │  Flow:                                              │
-// │   1. Draw title screen                              │
-// │   2. Wait for local FIRE press → broadcast LOBBY    │
-// │   3. Wait until peer also sends LOBBY (or READY)    │
-// │   4. Both ready → proceed to arena                  │
-// │                                                     │
-// │  The status line updates live so each player can    │
-// │  see whether the other has pressed yet.             │
 // └─────────────────────────────────────────────────────┘
 void showSplash() {
   tft.fillScreen(C_BG);
@@ -297,46 +312,51 @@ void showSplash() {
   tft.setCursor(95, 158);
   tft.print("2-PLAYER  \xb7  ESP-NOW");
 
-  // Status row — redrawn in the loop below
-  // y=185 : prompt line
-  // y=210 : P1 / P2 ready indicators
-
-  bool iReady   = false;
+  bool iReady = false;
   bool peerReady = false;
+  
+  // Cache to track and trigger UI updates only on state changes
+  bool lastIReady = !iReady;
+  bool lastPeerReady = !peerReady;
 
   // Consume any button already held at boot
   while (firePressed()) delay(10);
   prevFire = false;
 
   while (true) {
-    // ── Draw prompt depending on local state ─────────
-    tft.fillRect(0, 178, SCR_W, 60, C_BG);   // clear status area
+    // ── Check if any states changed since last loop ─────────
+    bool stateChanged = (iReady != lastIReady) || (peerReady != lastPeerReady);
 
-    if (!iReady) {
+    if (stateChanged) {
+      tft.fillRect(0, 178, SCR_W, 60, C_BG); // Clear text area only once on state changes
+
+      // Draw local readiness prompt
       tft.setTextSize(1);
-      tft.setTextColor(C_WHITE);
-      tft.setCursor(103, 182);
-      tft.print("Press FIRE to ready up");
-    } else {
-      tft.setTextSize(1);
-      tft.setTextColor(C_GREY);
-      tft.setCursor(118, 182);
-      tft.print("Waiting for peer...");
+      if (!iReady) {
+        tft.setTextColor(C_WHITE);
+        tft.setCursor(103, 182);
+        tft.print("Press FIRE to ready up");
+      } else {
+        tft.setTextColor(C_GREY);
+        tft.setCursor(118, 182);
+        tft.print("Waiting for peer...");
+      }
+
+      // ── P1 / P2 ready pips ───────────────────────────
+      bool p1Ready = (PLAYER_ID == 1) ? iReady : peerReady;
+      bool p2Ready = (PLAYER_ID == 2) ? iReady : peerReady;
+
+      tft.setTextColor(p1Ready ? C_P1 : C_GREY);
+      tft.setCursor(80, 210);
+      tft.print(p1Ready ? "P1  READY" : "P1  ......");
+
+      tft.setTextColor(p2Ready ? C_P2 : C_GREY);
+      tft.setCursor(190, 210);
+      tft.print(p2Ready ? "P2  READY" : "P2  ......");
+
+      lastIReady = iReady;
+      lastPeerReady = peerReady;
     }
-
-    // ── P1 / P2 ready pips ───────────────────────────
-    // Show which of the two players has pressed
-    bool p1Ready = (PLAYER_ID == 1) ? iReady   : peerReady;
-    bool p2Ready = (PLAYER_ID == 2) ? iReady   : peerReady;
-
-    tft.setTextSize(1);
-    tft.setTextColor(p1Ready ? C_P1 : C_GREY);
-    tft.setCursor(80, 210);
-    tft.print(p1Ready ? "P1  READY" : "P1  ......");
-
-    tft.setTextColor(p2Ready ? C_P2 : C_GREY);
-    tft.setCursor(190, 210);
-    tft.print(p2Ready ? "P2  READY" : "P2  ......");
 
     // ── Local button ─────────────────────────────────
     bool fireNow = firePressed();
@@ -349,17 +369,25 @@ void showSplash() {
     outPkt = { 0, 0, false, (uint8_t)MAX_HP, STATE_LOBBY };
     sendPacket();
 
-    // ── Check for peer response ───────────────────────
+    // ── Check for peer response (thread-safe copy) ───
+    bool localGotPacket = false;
+    Packet localInPkt;
     if (gotPacket) {
+      portENTER_CRITICAL(&pktMux);
+      localInPkt = inPktShared;
+      localGotPacket = true;
       gotPacket = false;
-      if (inPkt.state == STATE_LOBBY || inPkt.state == STATE_READY) {
+      portEXIT_CRITICAL(&pktMux);
+    }
+
+    if (localGotPacket) {
+      if (localInPkt.state == STATE_LOBBY || localInPkt.state == STATE_READY) {
         peerReady = true;
       }
     }
 
     // ── Both ready → enter game ───────────────────────
     if (iReady && peerReady) {
-      // Brief flash so both screens visually sync
       tft.fillRect(0, 178, SCR_W, 60, C_BG);
       tft.setTextSize(2);
       tft.setTextColor(C_WHITE);
@@ -369,10 +397,10 @@ void showSplash() {
       break;
     }
 
-    delay(80);   // ~12 checks/sec — plenty for a lobby
+    delay(80); // ~12 checks/sec
   }
 
-  // Flush button so it doesn't immediately fire in-game
+  // Flush button
   while (firePressed()) delay(10);
   prevFire = false;
 
@@ -381,23 +409,15 @@ void showSplash() {
 
 // ┌─────────────────────────────────────────────────────┐
 // │  WIN SPLASH                                         │
-// │  Blocking — mirrors the lobby flow in showSplash.   │
-// │                                                     │
-// │  1. Draw winner announcement (static, drawn once)   │
-// │  2. 3-second lockout countdown before FIRE works    │
-// │  3. After lockout: both players must press FIRE     │
-// │  4. "GAME START!" flash then return                 │
 // └─────────────────────────────────────────────────────┘
 void showWinSplash() {
   uint16_t wCol     = (winner == 1) ? C_P1 : C_P2;
   uint16_t loserCol = (winner == 1) ? C_P2 : C_P1;
 
-  // ── Static background (drawn once) ──────────────────
   tft.fillScreen(C_BG);
   tft.fillRect(0,   0, SCR_W,  6, wCol);
   tft.fillRect(0, 234, SCR_W,  6, loserCol);
 
-  // "PLAYER X WINS!" centred
   tft.setTextSize(3);
   tft.setTextColor(wCol);
   tft.setCursor(28, 48);
@@ -407,17 +427,19 @@ void showWinSplash() {
   tft.setCursor(98, 95);
   tft.print("WINS!");
 
-  // Thin divider
   tft.drawFastHLine(40, 125, SCR_W - 80, C_GREY);
 
-  // Drain any button press that happened during the kill
   while (firePressed()) delay(10);
   prevFire = false;
 
   uint32_t lockoutStart = millis();
   bool iReady    = false;
   bool peerReady = false;
+
   int  lastCountdown = -1;
+  bool lastP1Ready = !iReady; // caches to prevent spam redrawing
+  bool lastP2Ready = !peerReady;
+  bool lastInLockout = true;
 
   while (true) {
     uint32_t elapsed   = millis() - lockoutStart;
@@ -426,22 +448,25 @@ void showWinSplash() {
                          ? (int)((WIN_LOCKOUT_MS - elapsed + 999) / 1000)
                          : 0;
 
-    // ── Redraw status area only when something changes ─
     bool p1Ready = (PLAYER_ID == 1) ? iReady : peerReady;
     bool p2Ready = (PLAYER_ID == 2) ? iReady : peerReady;
 
-    if (countdown != lastCountdown || (!inLockout)) {
+    // Check if drawing updates are necessary
+    bool statusChanged = (countdown != lastCountdown) || 
+                         (inLockout != lastInLockout) ||
+                         (p1Ready != lastP1Ready) || 
+                         (p2Ready != lastP2Ready);
+
+    if (statusChanged) {
       tft.fillRect(0, 138, SCR_W, 102, C_BG);
 
       if (inLockout) {
-        // Countdown
         tft.setTextSize(2);
         tft.setTextColor(C_GREY);
         tft.setCursor(88, 148);
         tft.print("Rematch in  ");
         tft.print(countdown);
       } else {
-        // Per-player ready pips
         tft.setTextSize(1);
         tft.setTextColor(p1Ready ? C_P1 : C_GREY);
         tft.setCursor(60, 148);
@@ -457,6 +482,9 @@ void showWinSplash() {
       }
 
       lastCountdown = countdown;
+      lastInLockout = inLockout;
+      lastP1Ready = p1Ready;
+      lastP2Ready = p2Ready;
     }
 
     // ── Button (only after lockout) ───────────────────
@@ -466,7 +494,7 @@ void showWinSplash() {
       prevFire     = fireNow;
       if (clicked && !iReady) iReady = true;
     } else {
-      prevFire = firePressed();   // drain during lockout
+      prevFire = firePressed();
     }
 
     // ── Broadcast state ───────────────────────────────
@@ -474,10 +502,19 @@ void showWinSplash() {
     outPkt.hp    = tank[PLAYER_ID - 1].hp;
     sendPacket();
 
-    // ── Check peer ────────────────────────────────────
+    // ── Check peer (thread-safe copy) ────────────────
+    bool localGotPacket = false;
+    Packet localInPkt;
     if (gotPacket) {
+      portENTER_CRITICAL(&pktMux);
+      localInPkt = inPktShared;
+      localGotPacket = true;
       gotPacket = false;
-      if (inPkt.state == STATE_READY) peerReady = true;
+      portEXIT_CRITICAL(&pktMux);
+    }
+
+    if (localGotPacket) {
+      if (localInPkt.state == STATE_READY) peerReady = true;
     }
 
     // ── Both ready → break ────────────────────────────
@@ -494,7 +531,6 @@ void showWinSplash() {
     delay(80);
   }
 
-  // Flush button before returning to gameplay
   while (firePressed()) delay(10);
   prevFire = false;
 }
@@ -545,19 +581,35 @@ void stepBullets() {
       bullet[i].active = false; continue;
     }
 
-    int   target = (bullet[i].owner == 1) ? 1 : 0;
-    Tank& tgt    = tank[target];
-    if (tgt.alive &&
-        abs(bullet[i].x - tgt.x) < TANK_HALF + BULLET_R + 1 &&
-        abs(bullet[i].y - tgt.y) < TANK_HALF + BULLET_R + 1) {
-      bullet[i].active = false;
-      tgt.hp--;
-      if (tgt.hp <= 0) {
-        tgt.alive = false;
-        gameOver  = true;
-        winner    = bullet[i].owner;
+    // --- SELF-DAMAGE AUTHORITY HIT DETECTION ---
+    // P1's device only registers damage to P1, and P2's device only registers damage to P2.
+    int target = (bullet[i].owner == 1) ? 1 : 0;
+    
+    // Only check collision if we are the target player
+    if (target == (PLAYER_ID - 1)) {
+      Tank& tgt = tank[target];
+      if (tgt.alive &&
+          abs(bullet[i].x - tgt.x) < TANK_HALF + BULLET_R + 1 &&
+          abs(bullet[i].y - tgt.y) < TANK_HALF + BULLET_R + 1) {
+        bullet[i].active = false;
+        tgt.hp--;
+        if (tgt.hp <= 0) {
+          tgt.alive = false;
+          gameOver  = true;
+          winner    = bullet[i].owner;
+        }
+        continue;
       }
-      continue;
+    } else {
+      // For the peer tank, we check collision to clean up the bullet locally but do NOT apply damage.
+      // The peer's device is responsible for applying its own damage and broadcasting its new HP.
+      Tank& peerTgt = tank[target];
+      if (peerTgt.alive &&
+          abs(bullet[i].x - peerTgt.x) < TANK_HALF + BULLET_R + 1 &&
+          abs(bullet[i].y - peerTgt.y) < TANK_HALF + BULLET_R + 1) {
+        bullet[i].active = false;
+        continue;
+      }
     }
     paintBullet(bullet[i]);
   }
@@ -576,6 +628,10 @@ void readInput() {
   else if (rx > joyXCenter + dz) jx = map(rx, joyXCenter+dz,   4095,             0, 100);
   if      (ry < joyYCenter - dz) jy = map(ry, 0,               joyYCenter-dz, -100,  0);
   else if (ry > joyYCenter + dz) jy = map(ry, joyYCenter+dz,   4095,             0, 100);
+
+  // Apply deadzone to values close to center to eliminate sensor drift
+  if (abs(jx) < JOY_DEAD) jx = 0;
+  if (abs(jy) < JOY_DEAD) jy = 0;
 
   bool fireNow  = firePressed();
   outPkt.jx    = jx;
@@ -604,8 +660,15 @@ void setup() {
   analogReadResolution(12);
 
   delay(120);
-  joyXCenter = analogRead(PIN_JOY_X);
-  joyYCenter = analogRead(PIN_JOY_Y);
+  int rawX = analogRead(PIN_JOY_X);
+  int rawY = analogRead(PIN_JOY_Y);
+  
+  // Sanity check joystick center readings to handle startup drift or held joystick
+  if (rawX >= 1500 && rawX <= 2500) joyXCenter = rawX;
+  else joyXCenter = 2048;
+  if (rawY >= 1500 && rawY <= 2500) joyYCenter = rawY;
+  else joyYCenter = 2048;
+
   Serial.printf("Joy centre  X=%d  Y=%d\n", joyXCenter, joyYCenter);
 
   WiFi.mode(WIFI_STA);
@@ -616,7 +679,13 @@ void setup() {
     tft.setCursor(60, 110); tft.print("ESP-NOW FAIL");
     while (true) delay(1000);
   }
-  esp_now_register_recv_cb(onRecv);
+  
+  // Register callbacks (handling ESP32 Core v3 compatibility)
+  #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    esp_now_register_recv_cb(esp_now_recv_cb_t(onRecv));
+  #else
+    esp_now_register_recv_cb(onRecv);
+  #endif
   esp_now_register_send_cb(onSent);
 
   esp_now_peer_info_t peer{};
@@ -639,10 +708,17 @@ void loop() {
   int peerIdx = 1 - myIdx;
   int peerId  = 3 - PLAYER_ID;
 
-  // ── Process incoming packet ──────────────────────────
+  // ── Process incoming packet (Thread-Safe Double Buffer Copy) ────
+  bool localGotPacket = false;
   if (gotPacket) {
+    portENTER_CRITICAL(&pktMux);
+    inPkt = inPktShared;
+    localGotPacket = true;
     gotPacket = false;
+    portEXIT_CRITICAL(&pktMux);
+  }
 
+  if (localGotPacket) {
     if (!gameOver) {
       if (inPkt.state == STATE_P1WIN || inPkt.state == STATE_P2WIN) {
         gameOver = true;
@@ -651,6 +727,7 @@ void loop() {
         clearTank(tank[peerIdx]);
         moveTank(tank[peerIdx], inPkt.jx, inPkt.jy);
         if (inPkt.fire) fireBullet(tank[peerIdx], peerId);
+        // Sync peer HP directly from their broadcasted authoritative state
         tank[peerIdx].hp = inPkt.hp;
       }
     }
@@ -660,7 +737,6 @@ void loop() {
   //  GAME OVER PHASE
   // ════════════════════════════════════════════════════
   if (gameOver) {
-    // showWinSplash blocks until both players press FIRE
     showWinSplash();
     resetGame();
     drawArena();
@@ -686,7 +762,7 @@ void loop() {
     stepBullets();
     paintTank(tank[0], C_P1);
     paintTank(tank[1], C_P2);
-    drawHUD();
+    drawHUD(); // Redraws dynamically only when HP state actually changes
   }
 
   uint32_t tickElapsed = millis() - frameStart;
